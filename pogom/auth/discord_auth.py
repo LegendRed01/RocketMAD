@@ -26,7 +26,7 @@ class DiscordAuth(AuthBase):
             api_base_url='https://discordapp.com/api/v6',
             access_token_url='https://discordapp.com/api/oauth2/token',
             authorize_url='https://discordapp.com/api/oauth2/authorize',
-            authorize_params={ 'scope' : 'identify guilds' },
+            authorize_params={'scope': 'identify guilds'},
             fetch_token=self._fetch_token,
             update_token=self._update_token
         )
@@ -41,10 +41,11 @@ class DiscordAuth(AuthBase):
 
     def has_permission(self):
         resources = session.get('resources')
-        if resources is None or resources.get('expires_at', 0) < time.time():
+        if (not session.get('has_permission', False) or resources is None or
+                resources.get('expires_at', 0) < time.time()):
             self.update_resources()
 
-        if session.get('has_permission', False) == True:
+        if session.get('has_permission', False):
             return True, None
 
         # Check required guilds.
@@ -53,7 +54,7 @@ class DiscordAuth(AuthBase):
             if guild in session['resources']['guilds']:
                 in_required_guild = True
                 break
-        if len(args.discord_required_guilds) > 0  and not in_required_guild:
+        if len(args.discord_required_guilds) > 0 and not in_required_guild:
             log.debug('Permission denied for Discord user %s. '
                       'Reason: not a member of required Discord guilds.',
                       session['resources']['user']['username'])
@@ -63,12 +64,13 @@ class DiscordAuth(AuthBase):
         for guild in args.discord_blacklisted_guilds:
             if guild in session['resources']['guilds']:
                 log.debug('Permission denied for Discord user %s. '
-                          'Reason: member of blacklisted Discord guild \'%s\'.',
+                          'Reason: member of blacklisted Discord guild '
+                          '\'%s\'.',
                           session['resources']['user']['username'],
                           session['resources']['guilds'][guild]['name'])
                 return False, args.discord_no_permission_redirect
 
-        # Check roles.
+        # Check required roles.
         has_required_role = False
         for role in args.discord_required_roles:
             if ':' in role:
@@ -78,6 +80,9 @@ class DiscordAuth(AuthBase):
                 # No guild specified, use first required guild.
                 guild_id = args.discord_required_guilds[0]
                 role_id = role
+
+            if guild_id not in session['resources']['guilds']:
+                continue
 
             roles = session['resources']['guilds'][guild_id].get('roles')
             if roles is not None and role_id in roles:
@@ -91,6 +96,28 @@ class DiscordAuth(AuthBase):
                       session['resources']['user']['username'],
                       session['resources']['guilds'][guild_id]['name'])
             return False, args.discord_no_permission_redirect
+
+        # Check blacklisted roles.
+        for role in args.discord_blacklisted_roles:
+            if ':' in role:
+                guild_id = role.split(':')[0]
+                role_id = role.split(':')[1]
+            else:
+                # No guild specified, use first required guild.
+                guild_id = args.discord_required_guilds[0]
+                role_id = role
+
+            if guild_id not in session['resources']['guilds']:
+                continue
+
+            roles = session['resources']['guilds'][guild_id].get('roles')
+            if roles is not None and role_id in roles:
+                log.debug('Permission denied for Discord user %s. '
+                          'Reason: has blacklisted role '
+                          'for Discord guild \'%s\'.',
+                          session['resources']['user']['username'],
+                          session['resources']['guilds'][guild_id]['name'])
+                return False, args.discord_no_permission_redirect
 
         session['has_permission'] = True
         return True, None
@@ -112,6 +139,14 @@ class DiscordAuth(AuthBase):
                   session['resources']['user']['username'])
 
     def update_resources(self):
+        # Abort if last update was done less than 5 seconds ago
+        # to prevent rate limiting.
+        resources = session.get('resources')
+        if resources is not None:
+            last_updated_at = resources.get('last_updated_at', 0)
+            if last_updated_at + 5000 > time.time():
+                return
+
         session['resources'] = {}
 
         resp = self.oauth.discord.get('users/@me')
@@ -145,6 +180,36 @@ class DiscordAuth(AuthBase):
                     # No guild specified, use first required guild.
                     guild_id = args.discord_required_guilds[0]
 
+                if guild_id not in session['resources']['guilds']:
+                    continue
+
+                r = requests.get(self.oauth.discord.api_base_url + '/guilds/' +
+                                 guild_id + '/members/' + user_id,
+                                 headers=headers)
+                try:
+                    r.raise_for_status()
+                except Exception:
+                    log.error('%s returned from Discord guild member atempt: '
+                              '%s.', str(r.status_code), r.text)
+
+                roles = r.json()['roles']
+                session['resources']['guilds'][guild_id]['roles'] = roles
+
+        if len(args.discord_blacklisted_roles) > 0:
+            headers = {
+              'Authorization': 'Bot ' + args.discord_bot_token
+            }
+            user_id = session['resources']['user']['id']
+            for role in args.discord_blacklisted_roles:
+                if ':' in role:
+                    guild_id = role.split(':')[0]
+                else:
+                    # No guild specified, use first required guild.
+                    guild_id = args.discord_required_guilds[0]
+
+                if guild_id not in session['resources']['guilds']:
+                    continue
+
                 r = requests.get(self.oauth.discord.api_base_url + '/guilds/' +
                                  guild_id + '/members/' + user_id,
                                  headers=headers)
@@ -158,6 +223,7 @@ class DiscordAuth(AuthBase):
                 session['resources']['guilds'][guild_id]['roles'] = roles
 
         session['resources']['expires_at'] = time.time() + 3600
+        session['resources']['last_updated_at'] = time.time()
         session['has_permission'] = False
 
     def end_session(self):
